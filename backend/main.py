@@ -287,7 +287,8 @@ async def custom_chat(request: Request):
         body = {
             "model": "gpt-4o",
             "messages": openai_messages,
-            "stream": True
+            "stream": True,
+            "max_tokens": 500  # Limit maximum response length
         }
         
         # Add tools if provided
@@ -534,6 +535,11 @@ async def custom_chat(request: Request):
                                             # Add a small delay between tokens for smoother streaming
                                             await asyncio.sleep(0.02)
                                     
+                                    # If finish_reason is stop, send [DONE] to terminate stream
+                                    if choice.get("finish_reason") == "stop":
+                                        await yield_to_queue("[DONE]\n")
+                                        break
+                                    
                             except json.JSONDecodeError:
                                 # Skip invalid JSON
                                 continue
@@ -543,11 +549,16 @@ async def custom_chat(request: Request):
         
         # Yield from the queue as items become available
         try:
+            last_message_time = asyncio.get_event_loop().time()
+            
             while True:
                 try:
-                    item = await asyncio.wait_for(output_queue.get(), timeout=30.0)  # Reduce timeout for faster detection of completion
+                    item = await asyncio.wait_for(output_queue.get(), timeout=5.0)  # Reduce timeout for faster detection of completion
                     yield item
                     output_queue.task_done()
+                    
+                    # Update the last message time
+                    last_message_time = asyncio.get_event_loop().time()
                     
                     # If this is the [DONE] marker, break the loop to close the connection
                     if item.strip() == "[DONE]":
@@ -555,6 +566,13 @@ async def custom_chat(request: Request):
                         await asyncio.sleep(0.1)
                         break
                 except asyncio.TimeoutError:
+                    # Check if we've been idle too long (15 seconds)
+                    current_time = asyncio.get_event_loop().time()
+                    if current_time - last_message_time > 15:
+                        # Force completion after 15 seconds of inactivity
+                        yield "[DONE]\n"
+                        break
+                        
                     # Check if the task is done
                     if task.done():
                         # Send a final [DONE] if we didn't already

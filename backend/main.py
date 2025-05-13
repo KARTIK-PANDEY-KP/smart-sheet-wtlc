@@ -8,11 +8,14 @@ import re
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pinecone import Pinecone
 
 # ─── LOAD .env ───────────────────────────────────────────────
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_4KT4q5_NgcrXDWLU9SBSJij9SNuPiH8b8qXcAQrkk3RCyE9KkGtGV4bwyRimrktkdEWjqG")
+PINECONE_ENV = os.getenv("PINECONE_ENV", "us-west1-gcp")
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
 
@@ -21,6 +24,24 @@ if not PERPLEXITY_API_KEY:
     print("WARNING: PERPLEXITY_API_KEY is not set. Web search functionality will not work.")
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY is not set. API calls to OpenAI will fail.")
+if not PINECONE_API_KEY:
+    print("WARNING: PINECONE_API_KEY is not set. Interview search functionality will not work.")
+
+# Initialize Pinecone client
+try:
+    pc = Pinecone(
+        api_key=PINECONE_API_KEY,
+        environment=PINECONE_ENV
+    )
+    pinecone_index = pc.Index(
+        name="cq-transcripts-1",
+        pool_threads=50,
+        connection_pool_maxsize=50,
+    )
+    print("Pinecone initialized successfully.")
+except Exception as e:
+    print(f"ERROR initializing Pinecone: {str(e)}")
+    pinecone_index = None
 
 app = FastAPI()
 app.add_middleware(
@@ -86,6 +107,107 @@ async def web_search(query, stream_callback=None):
         print(error_message)
         return error_message
 
+async def interview_search(query, company_name="innabox", stream_callback=None):
+    """Search for interview transcripts using Pinecone."""
+    if not pinecone_index:
+        error_message = "Pinecone is not initialized. Cannot perform interview search."
+        print(error_message)
+        return error_message
+    
+    try:
+        # Send initial message if streaming
+        if stream_callback:
+            await stream_callback(f"Searching interview transcripts for: {query}")
+            await stream_callback("\nGenerating embeddings...")
+        
+        # Create embedding for query
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        
+        embed_body = {
+            "model": "text-embedding-3-small",
+            "input": query
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            embed_response = await client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers=headers,
+                json=embed_body
+            )
+            
+            if embed_response.status_code != 200:
+                error_message = f"Error generating embeddings: {embed_response.text}"
+                print(error_message)
+                return error_message
+            
+            embed_data = embed_response.json()
+            vector = embed_data["data"][0]["embedding"]
+            
+            # Query Pinecone with the embedding
+            if stream_callback:
+                await stream_callback("\nSearching Pinecone index...")
+            
+            # Execute the Pinecone query
+            response = pinecone_index.query(
+                vector=vector,
+                top_k=3,
+                include_metadata=True,
+                namespace=company_name
+            )
+            
+            # Process and format results
+            all_results = []
+            formatted_results = ""
+            
+            for i, match in enumerate(response.matches):
+                meta = match.metadata or {}
+                
+                # Pick the first available snippet field
+                snippet = None
+                for field in ("text", "snippet", "content", "transcript", "body"):
+                    if field in meta:
+                        snippet = meta[field]
+                        break
+                if snippet is None:
+                    snippet = "<no snippet available>"
+                
+                # Pick a filename (or fallback to 'source')
+                filename = meta.get("filename", meta.get("source", "unknown"))
+                
+                # Format the result
+                formatted_match = f"[{i+1}] [{filename}]\n{snippet}\n\n"
+                all_results.append({
+                    "filename": filename,
+                    "content": snippet,
+                    "score": match.score
+                })
+                
+                formatted_results += formatted_match
+                
+                # Stream this match if callback provided
+                if stream_callback:
+                    await stream_callback(f"\n[{i+1}] [{filename}]\n")
+                    
+                    # Stream the snippet in chunks for more natural flow
+                    chunk_size = 40
+                    snippet_chunks = [snippet[i:i+chunk_size] for i in range(0, len(snippet), chunk_size)]
+                    for chunk in snippet_chunks:
+                        await stream_callback(chunk)
+                        await asyncio.sleep(0.05)
+                    
+                    await stream_callback("\n\n")
+            
+            # Return the full formatted results
+            return formatted_results
+            
+    except Exception as e:
+        error_message = f"Exception in interview search: {str(e)}"
+        print(error_message)
+        return error_message
+
 @app.post("/api/my-custom-chat")
 async def custom_chat(request: Request):
     payload = await request.json()
@@ -93,25 +215,48 @@ async def custom_chat(request: Request):
     tools = payload.get("tools", [])
     user_messages = payload.get("messages", [])
     
-    # Add default web search tool if not present
+    # Add default tools if not present
     if not tools:
-        tools = [{
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web for real-time information about any topic.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query to look up on the web."
-                        }
-                    },
-                    "required": ["query"]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web for real-time information about any topic.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query to look up on the web."
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "interview_search",
+                    "description": "Search through interview transcripts for relevant information.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query to find relevant interview transcript segments."
+                            },
+                            "company_name": {
+                                "type": "string",
+                                "description": "The company namespace to search within. Defaults to 'innabox'."
+                            }
+                        },
+                        "required": ["query"]
+                    }
                 }
             }
-        }]
+        ]
     
     # Convert message format from content array to simple text for OpenAI
     openai_messages = []
@@ -238,16 +383,19 @@ async def custom_chat(request: Request):
                                                     arguments = json.loads(tool_call["function"]["arguments"])
                                                     query = arguments.get("query", "")
                                                     
-                                                    # Send initial search message
+                                                    # Send initial search message - special format tag for tool start
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_START>>\"\n")
+                                                    
+                                                    # Now send the actual search message
                                                     search_message = f"Searching for {query}..."
                                                     search_message = search_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
                                                     await yield_to_queue(f"{index}:\"{search_message}\"\n")
                                                     
-                                                    # Create a streaming callback for Perplexity
-                                                    async def stream_callback(chunk):
-                                                        await yield_to_queue(f"{index}:\"{chunk}\"\n")
-                                                    
                                                     # Execute web search with streaming
+                                                    async def stream_callback(chunk):
+                                                        escaped_chunk = chunk.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
+                                                        await yield_to_queue(f"{index}:\"{escaped_chunk}\"\n")
+                                                    
                                                     search_result = await web_search(query, stream_callback=stream_callback)
                                                     
                                                     # Add the function result to messages
@@ -256,6 +404,9 @@ async def custom_chat(request: Request):
                                                         "tool_call_id": tool_call["id"],
                                                         "content": search_result
                                                     })
+                                                    
+                                                    # Send the tool end marker
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_END>>\"\n")
                                                 except Exception as e:
                                                     # Handle errors in function execution
                                                     error_message = f"Error executing web_search: {str(e)}"
@@ -265,7 +416,54 @@ async def custom_chat(request: Request):
                                                         "tool_call_id": tool_call["id"],
                                                         "content": error_message
                                                     })
+                                                    
+                                                    # Send error with tool start/end tags
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_START>>\"\n")
                                                     await yield_to_queue(f"{index}:\"{error_message}\"\n")
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_END>>\"\n")
+                                            elif function_name == "interview_search":
+                                                try:
+                                                    arguments = json.loads(tool_call["function"]["arguments"])
+                                                    query = arguments.get("query", "")
+                                                    company_name = arguments.get("company_name", "innabox")
+                                                    
+                                                    # Send initial search message
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_START>>\"\n")
+                                                    
+                                                    search_message = f"Searching interview transcripts for '{query}' in company '{company_name}'..."
+                                                    search_message = search_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
+                                                    await yield_to_queue(f"{index}:\"{search_message}\"\n")
+                                                    
+                                                    # Execute interview search with streaming
+                                                    async def stream_callback(chunk):
+                                                        escaped_chunk = chunk.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
+                                                        await yield_to_queue(f"{index}:\"{escaped_chunk}\"\n")
+                                                    
+                                                    search_result = await interview_search(query, company_name, stream_callback=stream_callback)
+                                                    
+                                                    # Add the function result to messages
+                                                    new_messages.append({
+                                                        "role": "tool",
+                                                        "tool_call_id": tool_call["id"],
+                                                        "content": search_result
+                                                    })
+                                                    
+                                                    # Send the tool end marker
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_END>>\"\n")
+                                                except Exception as e:
+                                                    # Handle errors in function execution
+                                                    error_message = f"Error executing interview_search: {str(e)}"
+                                                    error_message = error_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
+                                                    new_messages.append({
+                                                        "role": "tool",
+                                                        "tool_call_id": tool_call["id"],
+                                                        "content": error_message
+                                                    })
+                                                    
+                                                    # Send error with tool start/end tags
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_START>>\"\n")
+                                                    await yield_to_queue(f"{index}:\"{error_message}\"\n")
+                                                    await yield_to_queue(f"{index}:\"<<TOOL_END>>\"\n")
                                         
                                         # Call OpenAI again with the results of the function call
                                         second_response = await client.post(
@@ -318,11 +516,6 @@ async def custom_chat(request: Request):
                                                                     await yield_to_queue(f"{second_index}:\"{escaped_content}\"\n")
                                                                     # Add a small delay between tokens for smoother streaming
                                                                     await asyncio.sleep(0.02)
-                                                                
-                                                                # Check if this is the end of the response
-                                                                # if second_choice.get("finish_reason") is not None:
-                                                                #     # Send an explicit [DONE] marker
-                                                                #     await yield_to_queue("[DONE]\n")
                                                     except json.JSONDecodeError:
                                                         # Skip invalid JSON
                                                         continue

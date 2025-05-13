@@ -29,16 +29,34 @@ if not PINECONE_API_KEY:
 
 # Initialize Pinecone client
 try:
+    print(f"Initializing Pinecone with API key (first 8 chars): {PINECONE_API_KEY[:8]}... and environment: {PINECONE_ENV}")
     pc = Pinecone(
         api_key=PINECONE_API_KEY,
         environment=PINECONE_ENV
     )
+    
+    print("Pinecone client initialized. Attempting to connect to index 'cq-transcripts-1'...")
+    
     pinecone_index = pc.Index(
         name="cq-transcripts-1",
         pool_threads=50,
         connection_pool_maxsize=50,
     )
-    print("Pinecone initialized successfully.")
+    
+    # Test the connection by listing namespaces (collections)
+    try:
+        print("Testing Pinecone connection...")
+        # Attempt to do a simple operation to verify the connection works
+        describe_response = pinecone_index.describe_index_stats()
+        print(f"Pinecone connection successful. Index stats: {describe_response}")
+        
+        # Get a list of namespaces
+        namespaces = describe_response.get("namespaces", {})
+        print(f"Available namespaces: {list(namespaces.keys())}")
+        print("Pinecone initialized successfully.")
+    except Exception as e:
+        print(f"WARNING: Pinecone connection test failed: {str(e)}")
+        # Still continue as the index might be valid
 except Exception as e:
     print(f"ERROR initializing Pinecone: {str(e)}")
     pinecone_index = None
@@ -93,25 +111,43 @@ async def web_search(query, stream_callback=None):
                             chunk_size = 30  # characters per chunk
                             for i in range(0, len(sentence), chunk_size):
                                 chunk = sentence[i:i+chunk_size]
-                                escaped_chunk = chunk.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
-                                await stream_callback(escaped_chunk)
+                                await stream_callback(chunk)
                                 await asyncio.sleep(0.1)  # Small delay for more natural streaming
                 
                 return result
             else:
                 error_message = f"Error in web search: Status {response.status_code}, Response: {response.text}"
                 print(error_message)
+                
+                # If there's an error when streaming, send a simplified error message
+                if stream_callback and callable(stream_callback):
+                    simple_error = f"Error {response.status_code} occurred when searching."
+                    await stream_callback(simple_error)
+                    
                 return error_message
     except Exception as e:
         error_message = f"Exception in web search: {str(e)}"
         print(error_message)
+        
+        # If there's an exception when streaming, send a simplified error message
+        if stream_callback and callable(stream_callback):
+            simple_error = f"Error occurred when searching: {str(e)[:50]}"
+            await stream_callback(simple_error)
+            
         return error_message
 
 async def interview_search(query, company_name="innabox", stream_callback=None):
     """Search for interview transcripts using Pinecone."""
+    print(f"Starting interview search for query: '{query}' in company: '{company_name}'")
+    
     if not pinecone_index:
         error_message = "Pinecone is not initialized. Cannot perform interview search."
         print(error_message)
+        
+        # If there's an error when streaming, send a simplified error message
+        if stream_callback and callable(stream_callback):
+            await stream_callback("Error: Pinecone is not initialized")
+            
         return error_message
     
     try:
@@ -131,6 +167,8 @@ async def interview_search(query, company_name="innabox", stream_callback=None):
             "input": query
         }
         
+        print(f"Generating embeddings for query: '{query}'")
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
             embed_response = await client.post(
                 "https://api.openai.com/v1/embeddings",
@@ -138,17 +176,29 @@ async def interview_search(query, company_name="innabox", stream_callback=None):
                 json=embed_body
             )
             
+            print(f"Embedding API response status: {embed_response.status_code}")
+            
             if embed_response.status_code != 200:
                 error_message = f"Error generating embeddings: {embed_response.text}"
                 print(error_message)
+                
+                # If there's an error when streaming, send a simplified error message
+                if stream_callback and callable(stream_callback):
+                    await stream_callback(f"Error: Unable to generate embeddings (status {embed_response.status_code})")
+                    
                 return error_message
             
             embed_data = embed_response.json()
             vector = embed_data["data"][0]["embedding"]
             
+            # Log the vector dimensions to ensure it's valid
+            print(f"Generated embedding vector of dimension: {len(vector)}")
+            
             # Query Pinecone with the embedding
             if stream_callback:
                 await stream_callback("\nSearching Pinecone index...")
+            
+            print(f"Querying Pinecone index with namespace: '{company_name}'")
             
             # Execute the Pinecone query
             response = pinecone_index.query(
@@ -158,9 +208,19 @@ async def interview_search(query, company_name="innabox", stream_callback=None):
                 namespace=company_name
             )
             
+            # Log the number of matches
+            print(f"Pinecone query returned {len(response.matches)} matches")
+            
             # Process and format results
             all_results = []
             formatted_results = ""
+            
+            if len(response.matches) == 0:
+                no_results_message = f"No results found for '{query}' in company '{company_name}'"
+                print(no_results_message)
+                if stream_callback:
+                    await stream_callback(f"\n{no_results_message}")
+                return no_results_message
             
             for i, match in enumerate(response.matches):
                 meta = match.metadata or {}
@@ -206,6 +266,11 @@ async def interview_search(query, company_name="innabox", stream_callback=None):
     except Exception as e:
         error_message = f"Exception in interview search: {str(e)}"
         print(error_message)
+        
+        # If there's an exception when streaming, send a simplified error message
+        if stream_callback and callable(stream_callback):
+            await stream_callback(f"Error occurred during interview search: {str(e)[:50]}")
+            
         return error_message
 
 @app.post("/api/my-custom-chat")
@@ -288,7 +353,7 @@ async def custom_chat(request: Request):
             "model": "gpt-4o",
             "messages": openai_messages,
             "stream": True,
-            "max_tokens": 500  # Limit maximum response length
+            # "max_tokens": 500  # Limit maximum response length
         }
         
         # Add tools if provided
@@ -314,7 +379,7 @@ async def custom_chat(request: Request):
                     if resp.status_code != 200:
                         error_text = await resp.text()
                         error_text = error_text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
-                        await yield_to_queue(f"error:\"{error_text}\"\n")
+                        await yield_to_queue(f"0:\"{error_text}\"\n")
                         return
                     
                     # Variables to track tool calls
@@ -420,6 +485,7 @@ async def custom_chat(request: Request):
                                                     
                                                     # Send error with tool start/end tags
                                                     await yield_to_queue(f"{index}:\"<<TOOL_START>>\"\n")
+                                                    error_message = error_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
                                                     await yield_to_queue(f"{index}:\"{error_message}\"\n")
                                                     await yield_to_queue(f"{index}:\"<<TOOL_END>>\"\n")
                                             elif function_name == "interview_search":
@@ -463,6 +529,7 @@ async def custom_chat(request: Request):
                                                     
                                                     # Send error with tool start/end tags
                                                     await yield_to_queue(f"{index}:\"<<TOOL_START>>\"\n")
+                                                    error_message = error_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
                                                     await yield_to_queue(f"{index}:\"{error_message}\"\n")
                                                     await yield_to_queue(f"{index}:\"<<TOOL_END>>\"\n")
                                         
@@ -498,7 +565,7 @@ async def custom_chat(request: Request):
                                                         # Mark that we've finished streaming the response
                                                         finished_streaming = True
                                                         # Send our own [DONE] marker when the stream is complete
-                                                        await yield_to_queue("[DONE]\n")
+                                                        await yield_to_queue(f"0:\"done\"\n")
                                                         break  # Exit the streaming loop
                                                     
                                                     try:
@@ -523,7 +590,7 @@ async def custom_chat(request: Request):
                                         else:
                                             error_text = await second_response.text()
                                             error_text = error_text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
-                                            await yield_to_queue(f"error:\"{error_text}\"\n")
+                                            await yield_to_queue(f"0:\"{error_text}\"\n")
                                     
                                     # Get content from delta (for normal responses)
                                     elif "delta" in choice and "content" in choice["delta"]:
@@ -537,7 +604,7 @@ async def custom_chat(request: Request):
                                     
                                     # If finish_reason is stop, send [DONE] to terminate stream
                                     if choice.get("finish_reason") == "stop":
-                                        await yield_to_queue("[DONE]\n")
+                                        await yield_to_queue(f"0:\"done\"\n")
                                         break
                                     
                             except json.JSONDecodeError:
@@ -561,7 +628,7 @@ async def custom_chat(request: Request):
                     last_message_time = asyncio.get_event_loop().time()
                     
                     # If this is the [DONE] marker, break the loop to close the connection
-                    if item.strip() == "[DONE]":
+                    if item.strip() == "0:\"done\"":
                         # Give a little time for client to process the [DONE] marker
                         await asyncio.sleep(0.1)
                         break
@@ -570,13 +637,13 @@ async def custom_chat(request: Request):
                     current_time = asyncio.get_event_loop().time()
                     if current_time - last_message_time > 15:
                         # Force completion after 15 seconds of inactivity
-                        yield "[DONE]\n"
+                        yield f"0:\"done\"\n"
                         break
                         
                     # Check if the task is done
                     if task.done():
                         # Send a final [DONE] if we didn't already
-                        yield "[DONE]\n"
+                        yield f"0:\"done\"\n"
                         break
         finally:
             # Make sure to clean up the task

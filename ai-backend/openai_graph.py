@@ -6,6 +6,10 @@ from search_tool import web_search
 from langgraph.prebuilt import ToolNode
 from langchain.agents import Tool
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 model = ChatOpenAI(model="gpt-4o", api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -14,6 +18,20 @@ agent_with_tools = model.bind_tools(tools)
 
 async def call_model(state, config):
     system = config["configurable"]["system"]
+    system += """
+    When using search results:
+    1. Extract URLs and key information from the search results
+    2. Format citations as numbered references with URLs:
+       [1] https://example.com/article1
+       [2] https://example.com/article2
+    3. In your response, cite sources using the numbers: "According to research [1], this is true..."
+    4. Always include the full URL in the citation list
+    5. Make sure each citation has a valid URL from the search results
+    6. Format your response with clear sections:
+       - Main answer
+       - Citations list at the end
+    """
+
     messages = [SystemMessage(content=system)] + state["messages"]
     response = await agent_with_tools.ainvoke(messages)
     return {"messages": response}

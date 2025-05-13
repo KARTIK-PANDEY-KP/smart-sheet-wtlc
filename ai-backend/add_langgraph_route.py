@@ -12,7 +12,6 @@ from pydantic import BaseModel
 from typing import List, Optional, Union, Any, Literal
 import asyncio
 
-
 # === Message Parts ===
 
 class TextPart(BaseModel):
@@ -107,12 +106,20 @@ def add_langgraph_route(app: FastAPI, graph, path: str):
                 ):
                 if isinstance(msg, ToolMessage):
                     # 1. Show tool output as its own message
-                    controller.append_text("\n🔍 **Perplexity Web Search**:\n\n")
+                    controller.append_text("\n```markdown\n")  # start markdown block
+
                     for line in str(msg.content).split("\n"):
                         if line.strip():
                             controller.append_text(line.strip() + "\n")
-                            await asyncio.sleep(0.05)  # optional: simulates human-like reveal
-                    controller.append_text("\n\n✅ Search complete.\n\n")
+                            await asyncio.sleep(0.05)
+
+                    controller.append_text("```\n")  # ✅ END markdown block
+                    controller.append_text("\n✅ Search complete.\n\n")
+
+                    # await controller.add_tool_result(
+                    #     tool_call_id=msg.tool_call_id,
+                    #     result=msg.content,
+                    # )
 
 
 
@@ -127,6 +134,7 @@ def add_langgraph_route(app: FastAPI, graph, path: str):
 
                     for chunk in getattr(msg, "tool_call_chunks", []):
                         if chunk["index"] not in tool_calls_by_index:
+                            controller.append_text("\n🔍 **Perplexity Web Search**:\n\n")
                             tool_controller = await controller.add_tool_call(
                                 chunk["name"], chunk["id"]
                             )

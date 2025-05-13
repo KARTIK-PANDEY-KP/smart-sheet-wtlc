@@ -10,7 +10,7 @@ import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbP
 
 export const Assistant = () => {
   const runtime = useChatRuntime({
-    api: "http://localhost:8000/api/my-custom-chat",
+    api: "http://localhost:3001/api/my-custom-chat",
   });
 
   return (

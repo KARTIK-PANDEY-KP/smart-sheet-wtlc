@@ -9,15 +9,16 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pinecone import Pinecone
-
-# ─── LOAD .env ───────────────────────────────────────────────
+ # ─── LOAD .env ───────────────────────────────────────────────
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_4KT4q5_NgcrXDWLU9SBSJij9SNuPiH8b8qXcAQrkk3RCyE9KkGtGV4bwyRimrktkdEWjqG")
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV", "us-west1-gcp")
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
+TABLE_API_URL = os.getenv("TABLE_API_URL", "http://localhost:8000/api/table/current")
 
 # Check if keys are available
 if not PERPLEXITY_API_KEY:
@@ -26,6 +27,74 @@ if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY is not set. API calls to OpenAI will fail.")
 if not PINECONE_API_KEY:
     print("WARNING: PINECONE_API_KEY is not set. Interview search functionality will not work.")
+
+async def fetch_table_data():
+    """Fetch current table data from the API"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            print(f"Fetching table data from {TABLE_API_URL}")
+            response = await client.get(TABLE_API_URL)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "tableData" in data:
+                    print("Successfully fetched table data")
+                    return data
+                else:
+                    print("Warning: Response did not contain expected 'tableData' field")
+                    return None
+            else:
+                print(f"Error fetching table data: Status {response.status_code}")
+                return None
+    except Exception as e:
+        print(f"Exception while fetching table data: {str(e)}")
+        return None
+
+def create_global_system_prompt():
+    """Create the global system prompt that will be used for all requests"""
+    base_prompt = "" # enter anything here that needs to be globally sent to all the OpenAI calls
+    
+    # This function will be called synchronously but we'll have the table data cached
+    # so it's not an issue
+    return base_prompt
+
+_cached_table_data = None
+_last_table_fetch_time = 0
+
+async def get_system_prompt_with_table_data():
+    """Get the system prompt, optionally with table data if available"""
+    global _cached_table_data, _last_table_fetch_time
+    
+    # Check if we need to refresh the cache (every 60 seconds)
+    current_time = asyncio.get_event_loop().time()
+    if current_time - _last_table_fetch_time > 60 or _cached_table_data is None:
+        _cached_table_data = await fetch_table_data()
+        _last_table_fetch_time = current_time
+    
+    base_prompt = ""
+    
+    # If we have table data, add it to the prompt
+    if _cached_table_data and "tableData" in _cached_table_data:
+        table_data = _cached_table_data["tableData"]
+        if table_data and len(table_data) > 0:
+            # Create a markdown table representation
+            table_str = "Here is the current table data you can reference:\n\n"
+            
+            # Add headers
+            if table_data and len(table_data) > 0:
+                headers = table_data[0].keys()
+                table_str += "| " + " | ".join(headers) + " |\n"
+                table_str += "| " + " | ".join(["---" for _ in headers]) + " |\n"
+                
+                # Add rows
+                for row in table_data:
+                    table_str += "| " + " | ".join([str(row.get(h, "")) for h in headers]) + " |\n"
+            
+            # Add the table data to the prompt
+            return f"{base_prompt}\n\n{table_str}\n\nRefer to this table data when answering questions about student information."
+    
+    # Return the base prompt if no table data
+    return base_prompt
 
 # Initialize Pinecone client
 try:
@@ -72,6 +141,15 @@ app.add_middleware(
 
 async def web_search(query, stream_callback=None):
     """Perform a web search using Perplexity API with optional streaming."""
+    print(f"Starting web search for query: '{query}'")
+    
+    # Check if PERPLEXITY_API_KEY is available
+    if not PERPLEXITY_API_KEY:
+        print("PERPLEXITY_API_KEY is not set. Using fallback search.")
+        if stream_callback and callable(stream_callback):
+            await stream_callback("Web search API key not found. Using alternative search method...")
+        return await fallback_search(query, stream_callback)
+    
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json",
@@ -83,58 +161,119 @@ async def web_search(query, stream_callback=None):
     }
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:  # Increase timeout to 2 minutes
             print(f"Making Perplexity API request for query: {query}")
-            response = await client.post(
-                PERPLEXITY_URL,
-                headers=headers,
-                json=body
-            )
+            print(f"Using API key (first 8 chars): {PERPLEXITY_API_KEY[:8]}...")
             
-            print(f"Perplexity API response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                result = data["choices"][0]["message"]["content"]
-                print(f"Perplexity search result (truncated): {result[:100]}...")
+            try:
+                print("Attempting to connect to Perplexity API...")
+                response = await client.post(
+                    PERPLEXITY_URL,
+                    headers=headers,
+                    json=body
+                )
+                print(f"Perplexity API call completed. Response status: {response.status_code}")
                 
-                # If streaming callback is provided, send chunks gradually
-                if stream_callback and callable(stream_callback):
-                    # Split the result into sentences for more natural streaming
-                    sentences = re.split(r'(?<=[.!?])\s+', result)
+                # Dump headers for debugging
+                print(f"Response headers: {dict(response.headers)}")
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        print(f"Response JSON keys: {data.keys()}")
+                        
+                        # Dump entire response for debugging (truncated)
+                        response_dump = str(data)[:1000] + "..." if len(str(data)) > 1000 else str(data)
+                        print(f"Response dump: {response_dump}")
+                        
+                        if "choices" not in data or len(data["choices"]) == 0:
+                            error_message = f"Unexpected response format: No choices in response. Full response: {data}"
+                            print(error_message)
+                            if stream_callback and callable(stream_callback):
+                                await stream_callback("Error: Unexpected response format from search API")
+                            return error_message
+                        
+                        result = data["choices"][0]["message"]["content"]
+                        print(f"Perplexity search result (truncated): {result[:100]}...")
+                        
+                        # If streaming callback is provided, send chunks gradually
+                        if stream_callback and callable(stream_callback):
+                            # Split the result into sentences for more natural streaming
+                            sentences = re.split(r'(?<=[.!?])\s+', result)
+                            
+                            # Stream each sentence with a small delay
+                            for sentence in sentences:
+                                sentence = sentence.strip()
+                                if sentence:
+                                    # Further break down long sentences into smaller chunks
+                                    chunk_size = 30  # characters per chunk
+                                    for i in range(0, len(sentence), chunk_size):
+                                        chunk = sentence[i:i+chunk_size]
+                                        await stream_callback(chunk)
+                                        await asyncio.sleep(0.1)  # Small delay for more natural streaming
+                        
+                        return result
+                    except json.JSONDecodeError as e:
+                        error_message = f"Error decoding JSON response: {str(e)}. Response content: {response.text[:500]}"
+                        print(error_message)
+                        if stream_callback and callable(stream_callback):
+                            await stream_callback("Error: Invalid response from search API")
+                        return error_message
+                    except KeyError as e:
+                        error_message = f"Key error in response: {str(e)}. Response content: {response.json()}"
+                        print(error_message)
+                        if stream_callback and callable(stream_callback):
+                            await stream_callback(f"Error: Missing data in API response: {str(e)}")
+                        return error_message
+                else:
+                    error_message = f"Error in web search: Status {response.status_code}"
+                    if response.status_code == 401:
+                        error_message += " - Unauthorized. Check your API key."
+                    elif response.status_code == 403:
+                        error_message += " - Forbidden. API key may be invalid or expired."
+                    else:
+                        try:
+                            error_message += f", Response: {response.text}"
+                        except Exception:
+                            error_message += " (Could not read response body)"
                     
-                    # Stream each sentence with a small delay
-                    for sentence in sentences:
-                        sentence = sentence.strip()
-                        if sentence:
-                            # Further break down long sentences into smaller chunks
-                            chunk_size = 30  # characters per chunk
-                            for i in range(0, len(sentence), chunk_size):
-                                chunk = sentence[i:i+chunk_size]
-                                await stream_callback(chunk)
-                                await asyncio.sleep(0.1)  # Small delay for more natural streaming
-                
-                return result
-            else:
-                error_message = f"Error in web search: Status {response.status_code}, Response: {response.text}"
-                print(error_message)
-                
-                # If there's an error when streaming, send a simplified error message
-                if stream_callback and callable(stream_callback):
-                    simple_error = f"Error {response.status_code} occurred when searching."
-                    await stream_callback(simple_error)
+                    print(error_message)
                     
-                return error_message
+                    # If there's an error when streaming, use fallback search
+                    print("Web search API failed. Using fallback search.")
+                    if stream_callback and callable(stream_callback):
+                        await stream_callback("Web search encountered an error. Using alternative search method...")
+                    
+                    return await fallback_search(query, stream_callback)
+            except httpx.TimeoutException:
+                error_message = "Search request timed out after 120 seconds"
+                print(f"ERROR: {error_message}")
+                if stream_callback and callable(stream_callback):
+                    await stream_callback("Web search timed out. Using alternative search method...")
+                return await fallback_search(query, stream_callback)
+            except httpx.RequestError as exc:
+                error_message = f"An error occurred while requesting from Perplexity API: {exc}"
+                print(f"HTTPX REQUEST ERROR: {error_message}")
+                if stream_callback and callable(stream_callback):
+                    await stream_callback(f"Web search connection error. Using alternative search method... Error: {str(exc)[:50]}")
+                return await fallback_search(query, stream_callback)
+            except Exception as e:
+                # Catch any other exceptions during the API call or initial processing
+                error_message = f"Unexpected exception during Perplexity API call or initial response handling: {str(e)}"
+                print(f"UNEXPECTED ERROR (during API call phase): {error_message}")
+                if stream_callback and callable(stream_callback):
+                    await stream_callback(f"Unexpected web search error. Using alternative search method... Error: {str(e)[:50]}")
+                return await fallback_search(query, stream_callback)
+                
     except Exception as e:
-        error_message = f"Exception in web search: {str(e)}"
-        print(error_message)
+        error_message = f"Outer exception in web search: {str(e)}" # Renamed for clarity
+        print(f"OUTER EXCEPTION (web_search): {error_message}")
         
-        # If there's an exception when streaming, send a simplified error message
+        # If there's an exception when streaming, use fallback search
         if stream_callback and callable(stream_callback):
-            simple_error = f"Error occurred when searching: {str(e)[:50]}"
-            await stream_callback(simple_error)
-            
-        return error_message
+            await stream_callback(f"Web search error: {str(e)[:30]}... Using alternative search method...")
+        
+        return await fallback_search(query, stream_callback)
 
 async def interview_search(query, company_name="innabox", stream_callback=None):
     """Search for interview transcripts using Pinecone."""
@@ -273,6 +412,94 @@ async def interview_search(query, company_name="innabox", stream_callback=None):
             
         return error_message
 
+async def fallback_search(query, stream_callback=None):
+    """Perform a fallback search using OpenAI when Perplexity fails."""
+    print(f"Using fallback search for query: '{query}'")
+    
+    if not OPENAI_API_KEY:
+        error_message = "OpenAI API key not available for fallback search."
+        print(error_message)
+        if stream_callback and callable(stream_callback):
+            await stream_callback("Error: Unable to perform fallback search.")
+        return error_message
+    
+    try:
+        # Craft a prompt that asks for a factual response about the query
+        prompt = f"""Please provide a factual, up-to-date summary about: {query}
+        
+Focus on providing accurate information only. Include key facts and figures if relevant.
+If the information would require very recent data that might not be in your training data,
+please mention that limitation.
+        
+Respond in a concise, informative manner without any filler text or disclaimers."""
+        
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant providing factual information. Always address the user as KARTIK in your responses."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,  # Keep temperature low for more factual responses
+            "max_tokens": 800
+        }
+        
+        if stream_callback:
+            await stream_callback("Using AI to generate information about your query...")
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            print("Making OpenAI API request for fallback search")
+            response = await client.post(
+                OPENAI_URL,
+                headers=headers,
+                json=body
+            )
+            
+            print(f"OpenAI API response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                result = data["choices"][0]["message"]["content"]
+                print(f"Fallback search result (truncated): {result[:100]}...")
+                
+                # Send each paragraph separately for more natural streaming
+                if stream_callback and callable(stream_callback):
+                    paragraphs = result.split("\n\n")
+                    for paragraph in paragraphs:
+                        if paragraph.strip():
+                            # Further chunk the paragraph for smoother streaming
+                            chunk_size = 40
+                            for i in range(0, len(paragraph), chunk_size):
+                                chunk = paragraph[i:i+chunk_size]
+                                await stream_callback(chunk)
+                                await asyncio.sleep(0.05)
+                            
+                            # Add a newline between paragraphs
+                            await stream_callback("\n\n")
+                
+                # Add a note about where the information came from
+                note = "\n\nNote: This information was generated using AI and may not include the very latest developments."
+                if stream_callback:
+                    await stream_callback(note)
+                
+                return result + note
+            else:
+                error_message = f"Error in fallback search: Status {response.status_code}"
+                print(error_message)
+                if stream_callback:
+                    await stream_callback("Unable to retrieve information from fallback search.")
+                return error_message
+    except Exception as e:
+        error_message = f"Exception in fallback search: {str(e)}"
+        print(error_message)
+        if stream_callback:
+            await stream_callback("An error occurred during the fallback search.")
+        return error_message
+
 @app.post("/api/my-custom-chat")
 async def custom_chat(request: Request):
     payload = await request.json()
@@ -326,9 +553,15 @@ async def custom_chat(request: Request):
     # Convert message format from content array to simple text for OpenAI
     openai_messages = []
     
-    # Add system message if provided
+    # Get our enhanced system prompt with table data
+    enhanced_system_prompt = await get_system_prompt_with_table_data()
+    
+    # Add system message - use enhanced prompt or user-provided one
     if system_prompt:
-        openai_messages.append({"role": "system", "content": system_prompt})
+        # Combine our enhanced prompt with user-provided one
+        openai_messages.append({"role": "system", "content": f"{enhanced_system_prompt}\n\n{system_prompt}"})
+    else:
+        openai_messages.append({"role": "system", "content": enhanced_system_prompt})
     
     # Convert user messages to OpenAI format
     for msg in user_messages:
@@ -351,7 +584,7 @@ async def custom_chat(request: Request):
         
         body = {
             "model": "gpt-4o",
-            "messages": openai_messages,
+            "messages": openai_messages,  # We've already added the system message above
             "stream": True,
             # "max_tokens": 500  # Limit maximum response length
         }
@@ -377,7 +610,16 @@ async def custom_chat(request: Request):
                     json=body
                 ) as resp:
                     if resp.status_code != 200:
-                        error_text = await resp.text()
+                        try:
+                            # For streaming responses, we shouldn't access .text() directly
+                            # Instead, read the response content manually
+                            content = b""
+                            async for chunk in resp.aiter_bytes():
+                                content += chunk
+                            error_text = content.decode('utf-8', errors='replace')
+                        except Exception as e:
+                            error_text = f"Error reading response (status {resp.status_code}): {str(e)}"
+                        
                         error_text = error_text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
                         await yield_to_queue(f"0:\"{error_text}\"\n")
                         return
@@ -453,16 +695,40 @@ async def custom_chat(request: Request):
                                                     await yield_to_queue(f"{index}:\"<<TOOL_START>>\"\n")
                                                     
                                                     # Now send the actual search message
-                                                    search_message = f"Searching for {query}..."
-                                                    search_message = search_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
-                                                    await yield_to_queue(f"{index}:\"{search_message}\"\n")
+                                                    # search_message = f"Searching for {query}..."
+                                                    # search_message = search_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
+                                                    # await yield_to_queue(f"{index}:\"{search_message}\"\n")
                                                     
                                                     # Execute web search with streaming
                                                     async def stream_callback(chunk):
+                                                        print(f"Web search chunk: {chunk[:50]}..." if len(chunk) > 50 else f"Web search chunk: {chunk}")
                                                         escaped_chunk = chunk.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
                                                         await yield_to_queue(f"{index}:\"{escaped_chunk}\"\n")
+
+                                                        # Add a small delay to ensure chunks are properly sent and processed
+                                                        await asyncio.sleep(0.05)
+                                                    
+                                                    # Now send the actual search message
+                                                    search_message = f"Searching for {query}..."
+                                                    search_message = search_message.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
+                                                    await yield_to_queue(f"{index}:\"{search_message}\"\n")
+                                                    await asyncio.sleep(0.1)
                                                     
                                                     search_result = await web_search(query, stream_callback=stream_callback)
+                                                    print(f"Web search complete. Result length: {len(search_result)}")
+                                                    
+                                                    # Check if the result is an error message or empty
+                                                    if search_result.startswith("Error") or "error" in search_result.lower() or len(search_result.strip()) < 20:
+                                                        print(f"Web search failed or returned minimal results: {search_result}")
+                                                        
+                                                        # Provide a useful fallback message to the user
+                                                        fallback_message = f"I couldn't retrieve current search results for '{query}'. This might be due to API limitations. Please try again later or rephrase your query."
+                                                        
+                                                        # Stream the fallback message
+                                                        await stream_callback(fallback_message)
+                                                        
+                                                        # Use the fallback message as the search result
+                                                        search_result = fallback_message
                                                     
                                                     # Add the function result to messages
                                                     new_messages.append({
@@ -539,8 +805,10 @@ async def custom_chat(request: Request):
                                             headers=headers,
                                             json={
                                                 "model": "gpt-4o",
-                                                "messages": new_messages,
-                                                "stream": True
+                                                "messages": new_messages,  # We now have the system message in new_messages already
+                                                "stream": True,
+                                                "temperature": 0.7,  # Add temperature to ensure valid responses
+                                                "max_tokens": 1000  # Increase max_tokens to ensure complete responses
                                             }
                                         )
                                         
@@ -564,8 +832,6 @@ async def custom_chat(request: Request):
                                                     if second_line == "[DONE]":
                                                         # Mark that we've finished streaming the response
                                                         finished_streaming = True
-                                                        # Send our own [DONE] marker when the stream is complete
-                                                        await yield_to_queue(f"0:\"done\"\n")
                                                         break  # Exit the streaming loop
                                                     
                                                     try:
@@ -588,7 +854,16 @@ async def custom_chat(request: Request):
                                                         # Skip invalid JSON
                                                         continue
                                         else:
-                                            error_text = await second_response.text()
+                                            try:
+                                                # For streaming responses, we shouldn't access .text() directly
+                                                # Instead, read the response content manually
+                                                content = b""
+                                                async for chunk in second_response.aiter_bytes():
+                                                    content += chunk
+                                                error_text = content.decode('utf-8', errors='replace')
+                                            except Exception as e:
+                                                error_text = f"Error reading response (status {second_response.status_code}): {str(e)}"
+                                            
                                             error_text = error_text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
                                             await yield_to_queue(f"0:\"{error_text}\"\n")
                                     
@@ -604,7 +879,6 @@ async def custom_chat(request: Request):
                                     
                                     # If finish_reason is stop, send [DONE] to terminate stream
                                     if choice.get("finish_reason") == "stop":
-                                        await yield_to_queue(f"0:\"done\"\n")
                                         break
                                     
                             except json.JSONDecodeError:
@@ -620,7 +894,7 @@ async def custom_chat(request: Request):
             
             while True:
                 try:
-                    item = await asyncio.wait_for(output_queue.get(), timeout=5.0)  # Reduce timeout for faster detection of completion
+                    item = await asyncio.wait_for(output_queue.get(), timeout=1.0)  # Reduce timeout for faster detection of completion
                     yield item
                     output_queue.task_done()
                     
@@ -635,15 +909,12 @@ async def custom_chat(request: Request):
                 except asyncio.TimeoutError:
                     # Check if we've been idle too long (15 seconds)
                     current_time = asyncio.get_event_loop().time()
-                    if current_time - last_message_time > 15:
+                    if current_time - last_message_time > 50:
                         # Force completion after 15 seconds of inactivity
-                        yield f"0:\"done\"\n"
                         break
                         
                     # Check if the task is done
                     if task.done():
-                        # Send a final [DONE] if we didn't already
-                        yield f"0:\"done\"\n"
                         break
         finally:
             # Make sure to clean up the task
@@ -661,6 +932,107 @@ async def custom_chat(request: Request):
         media_type="text/plain",
         headers={"Connection": "close"}  # Explicitly tell client to close the connection
     )
+
+@app.get("/api/test-perplexity")
+async def test_perplexity():
+    """Test endpoint to verify Perplexity API connectivity."""
+    if not PERPLEXITY_API_KEY:
+        return {"status": "error", "message": "PERPLEXITY_API_KEY not set"}
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        
+        body = {
+            "model": "sonar-reasoning-pro",
+            "messages": [{"role": "user", "content": "What day is it today?"}],
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                PERPLEXITY_URL,
+                headers=headers,
+                json=body
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get("choices", [{}])[0].get("message", {}).get("content", "No content")
+                return {
+                    "status": "success",
+                    "message": "Perplexity API is working",
+                    "response_code": response.status_code,
+                    "result_sample": result[:100] + "..." if len(result) > 100 else result
+                }
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Perplexity API returned status code {response.status_code}",
+                    "response": response.text
+                }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Exception while testing Perplexity API: {str(e)}"
+        }
+
+@app.post("/api/update-perplexity-key")
+async def update_perplexity_key(request: Request):
+    """Update the Perplexity API key at runtime."""
+    global PERPLEXITY_API_KEY
+    
+    try:
+        data = await request.json()
+        new_key = data.get("api_key")
+        
+        if not new_key:
+            return {"status": "error", "message": "No API key provided"}
+        
+        # Store the old key to revert if testing fails
+        old_key = PERPLEXITY_API_KEY
+        
+        # Update the key
+        PERPLEXITY_API_KEY = new_key
+        
+        # Test the new key
+        headers = {
+            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        
+        body = {
+            "model": "sonar-reasoning-pro",
+            "messages": [{"role": "user", "content": "Test message"}],
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                PERPLEXITY_URL,
+                headers=headers,
+                json=body
+            )
+            
+            if response.status_code == 200:
+                return {
+                    "status": "success",
+                    "message": "Perplexity API key updated and verified",
+                    "key_preview": f"{PERPLEXITY_API_KEY[:8]}..."
+                }
+            else:
+                # Revert to the old key if the new one doesn't work
+                PERPLEXITY_API_KEY = old_key
+                return {
+                    "status": "error",
+                    "message": f"New API key validation failed with status code {response.status_code}",
+                    "response": response.text
+                }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Exception while updating Perplexity API key: {str(e)}"
+        }
 
 if __name__ == "__main__":
     import uvicorn
